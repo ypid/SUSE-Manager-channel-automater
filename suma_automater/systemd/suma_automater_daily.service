@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2021 Robin Schneider <robin.schneider@geberit.com>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+[Unit]
+Description=Run daily patch phases scripts.
+
+[Service]
+Type=oneshot
+
+# Workaround, this should happen automatically.
+ExecStart=-/usr/bin/salt --state-output=mixed --state-verbose=False -C '*' state.apply channels
+
+ExecStart=/usr/local/bin/suma_channel_automater --journald --quiet --stage create_archive_channels
+ExecStart=/usr/local/bin/suma_channel_automater --journald --quiet --stage promote_channels --patch-phase phase-first
+ExecStart=/usr/local/bin/suma_channel_automater --journald --quiet --stage cleanup_archive_channels
+ExecStart=/usr/local/bin/suma_channel_automater --journald --quiet --stage create_activation_keys --patch-phase phase-last
+
+ExecStart=/usr/local/bin/suma_channel_automater --journald --quiet --stage update_system_groups
+ExecStart=/usr/local/bin/suma_channel_automater --journald --quiet --stage update_system_channels

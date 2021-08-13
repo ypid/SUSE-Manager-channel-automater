@@ -1,0 +1,4 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: suma_automater
+Upstream-Contact: Robin Schneider <robin.schneider@geberit.com>
+Source: https://github.com/geberit/gnu-linux-ops/tree/main/suma_automater

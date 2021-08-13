@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2021 Robin Schneider <robin.schneider@geberit.com>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+[Unit]
+Description=Run %i patch phase using SUSE Manager.
+
+[Service]
+Type=oneshot
+
+ExecStart=/usr/local/bin/suma_channel_automater --journald --quiet --stage promote_channels --patch-phase '%i'

@@ -1,0 +1,1642 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# vim:foldmarker=[[[,]]]:foldmethod=marker
+#
+# SPDX-FileCopyrightText: 2019-2021 Robin Schneider <robin.schneider@geberit.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+"""
+SUSE Manager automater.
+
+TODO: Use Content Lifecycle API from SUSE Manager 4.0 for the heavy lifting.
+This script should then only control the lifecycles. Advantages: Content
+Lifecycle is GUI integrated and provides powerful filtering.
+"""
+
+import os
+import re
+import sys
+import datetime
+import logging
+import inspect
+import copy
+import textwrap
+#  import six
+from socket import getfqdn
+try:  # Python 3
+    from xmlrpc import client as xmlrpclib
+except ImportError:  # Fallback Python 2
+    import xmlrpclib
+try:  # Python 3
+    from configparser import SafeConfigParser
+except ImportError:  # Fallback Python 2
+    from ConfigParser import SafeConfigParser
+
+import confuse
+
+import ypid.helpers
+
+__version__ = '2.4.0'
+__maintainer__ = 'Robin Schneider <robin.schneider@geberit.com>'
+_LOG = logging.getLogger(__name__)
+LOG = ypid.helpers.LogExtraAsJsonDataAdapter(_LOG, {}, globals())
+
+
+_SYSTEM_CONF_FILE = '/etc/spacecmd.conf'
+
+CONFIG_TEMPLATE = {
+    'patch_phases': list,
+    'architectures': list,
+    # List generated with:
+    #  arches = self._xml_rpc.channel.software.listArches(self._xml_rpc_key)
+    #  print([re.sub(r'^channel-', '', arch['label']) for arch in arches])
+    # Statically included here because the help text should not trigger an API call.
+    #
+    #  'architectures': confuse.OneOf([
+    #      'ia32', 'ia32-deb', 'ia64', 'ia64-deb', 'sparc', 'sparc-deb',
+    #      'alpha', 'alpha-deb', 's390', 's390-deb', 's390x', 'iSeries',
+    #      'pSeries', 'x86_64', 'amd64-deb', 'ppc', 'ppc64le', 'powerpc-deb',
+    #      'arm', 'armhfp', 'aarch64', 'arm-deb', 'mips-deb'
+    #  ]),
+    'pillar_path_of_minion_patch_phase': 'cmdb:patch_phase',
+    'channel_label_exclude_patterns': list,
+    'current_updates_channel_label_prefix': 'current_updates-',
+    'current_updates_channel_name_prefix': 'Current updates - ',
+    'system_groups': confuse.Sequence({
+        'salt_run': list,
+        'mapping': dict,
+    }),
+    'system_custominfo': confuse.Sequence({
+        'salt_run': list,
+        'label': str,
+        'description': str,
+    }),
+}
+
+
+class MyCLIParser(ypid.helpers.CLIParser):
+    def add_custom_arguments(self):
+        self.add_argument(
+            '-s', '--stage',
+            help="Stage to run.",
+            required=True,
+            # List of methods which are exposed on a CLI level.
+            choices=[
+                'setup',
+                'create_archive_channels',
+                'cleanup_archive_channels',
+                'create_current_updates_channels',
+                'create_activation_keys',
+                'promote_channels',
+                'delete_channels',
+                'update_system_channels',
+                'update_system_groups',
+                'update_system_custominfo',
+            ],
+        )
+        self.add_argument(
+            '-p', '--parent-channel-filter',
+            help="Only operate on the provided parent channel without any pre- or suffixes. Example: sles12-sp4-pool-x86_64.",
+        )
+        self.add_argument(
+            '-S', '--spacecmd-config',
+            help="Path to user spacecmd configuration file.",
+            default=os.path.join(os.path.expanduser('~/.spacecmd'), 'config'),
+            dest='spacecmd_conf_file',
+        )
+        # Needed?
+        #  self.add_argument(
+        #      '--immutable-pool',
+        #      help="Consider Pool respositories to be immutable.",
+        #  )
+        self.add_argument(
+            '-n', '--dry-run',
+            help="Trail run without changing anything.",
+            action="store_true",
+        )
+        self.add_argument(
+            '-F', '--fast',
+            help="Avoid slow operations.",
+            # "Borrowed" from git-annex.
+            action="store_true",
+        )
+
+
+class SuMaAutomater(object):
+    """
+    Mostly based on https://web.archive.org/web/20190501035733/https://www.suse.com/documentation/suse-best-practices/susemanager/data/susemanager.html
+
+    All mutable API calls (which change something) MUST be implemented as
+    /_ensure_.*/ class methods. Those methods MUST be idempotent where
+    possible.
+    """
+
+    def __init__(
+            self,
+            config,
+            dry_run=False,
+            fast=False,
+            parent_channel_filter=None,
+    ):
+
+        self._config = config
+        self._dry_run = dry_run
+        self._fast = fast
+        self._parent_channel_filter = parent_channel_filter
+
+        self._stage_name = None
+        self._state_reset()
+
+    def _state_reset(self):
+        self._org_id = None
+        self._org_name = None
+        self._inactive_systems = None
+
+    def login(self, spacecmd_conf_file):
+        # Files are loaded from `~/.spacecmd/`.
+
+        # Server-specifics will be loaded from the configuration file later.
+        config = SafeConfigParser({'server': getfqdn()})
+        config.read([_SYSTEM_CONF_FILE, spacecmd_conf_file])
+
+        xml_rpc_url = 'https://{host}/rpc/api'.format(
+            host=config.get('spacecmd', 'server'))
+        self._xml_rpc = xmlrpclib.Server(xml_rpc_url, verbose=0)
+        self._username = config.get('spacecmd', 'username')
+        self._xml_rpc_key = self._xml_rpc.auth.login(
+            self._username,
+            config.get('spacecmd', 'password'))
+
+        return True
+
+    def logout(self):
+        self._state_reset()
+
+        return self._xml_rpc.auth.logout(self._xml_rpc_key)
+
+    def _log_method_start(self):
+        if sys.version_info >= (3, 5):
+            self._stage_name = inspect.stack()[1].function
+        else:
+            self._stage_name = inspect.stack()[1][3]
+
+        log_structured_data = {
+            'org_id': self._get_current_org_id(),
+            'org_name': self._get_current_org_name(),
+            'stage_name': self._stage_name,
+        }
+
+        LOG.info(
+            '{stage_name}: Running in the context of organization {org_name}.'
+            ' org_id: {org_id}.'.format(**log_structured_data),
+            extra=log_structured_data)
+
+    def _get_current_org_id(self):
+        if self._org_id is None:
+            self._org_id = self._xml_rpc.user.getDetails(self._xml_rpc_key, self._username)['org_id']
+
+        return self._org_id
+
+    def _get_current_org_name(self):
+        if self._org_name is None:
+            self._org_name = self._xml_rpc.org.getDetails(self._xml_rpc_key, self._get_current_org_id())['name']
+
+        return self._org_name
+
+    def _should_skip_parent_channel(self, parent_channel_label, channel_label, parent_channel_filter=None):
+        if parent_channel_filter is None:
+            parent_channel_filter = self._parent_channel_filter
+
+        if parent_channel_filter:
+            channel_label_to_check = parent_channel_label
+            if parent_channel_label == '':
+                channel_label_to_check = channel_label
+
+            parent_channel_filter_re = re.compile(r'\b{}\b'.format(re.escape(parent_channel_filter)))
+            if not parent_channel_filter_re.search(channel_label_to_check):
+
+                #  log_structured_data = {
+                #      'parent_channel_label': parent_channel_label,
+                #      'channel_label': channel_label,
+                #      'channel_label_to_check': channel_label_to_check,
+                #      'parent_channel_filter': parent_channel_filter,
+                #      'stage_name': self._stage_name,
+                #  }
+                #  LOG.debug(
+                #      '{stage_name}: Skipping parent channel because filter {parent_channel_filter}'
+                #      ' did not match {channel_label_to_check} ({channel_label})'.format(**log_structured_data),
+                #      extra=log_structured_data)
+                return True
+
+        return False
+
+    def _vendor_channel_is_immutable(self, channel_label):
+        # suse-packagehub-.*-pool-.* repos make an exception here as even the pool variants are not frozen.
+        # TODO: Maybe I am wrong about PackageHub and Pool is stable. Lets see in the archive.
+        if '-updates-' in channel_label or '-packagehub-' in channel_label:
+            return False
+
+        return True
+
+    def _ensure_channel_is_created(self, channel_details, existing_labels=None):
+        if not existing_labels:
+            existing_labels = set()
+
+        if channel_details['label'] not in existing_labels:
+            log_structured_data = {'channel_'+k: v for k, v in channel_details.items()}
+            log_structured_data.update({
+                'stage_name': self._stage_name,
+                'event': {
+                    'dry_run': self._dry_run,
+                    'action': 'software_channel-create',
+                },
+            })
+            channel_details.update({
+                'stage_name': self._stage_name,
+            })
+            changed = False
+            if self._dry_run:
+                changed = True
+            else:
+                try:
+                    self._xml_rpc.channel.software.create(
+                        self._xml_rpc_key,
+                        channel_details['label'],
+                        channel_details['name'],
+                        channel_details['summary'],
+                        channel_details['arch_label'],
+                        channel_details['parent_channel_label'],
+                        channel_details.get('checksumType', 'sha256'),
+                        {
+                            'url': channel_details.get('gpg_key_url', ''),
+                            'id': channel_details.get('gpg_key_id', ''),
+                            'fingerprint': channel_details.get('gpg_key_fp', ''),
+                        },
+                        channel_details.get('gpg_check', True))
+                except xmlrpclib.Fault as err:
+                    if 'is already in use, please enter a different name' not in str(err):
+                        raise xmlrpclib.Fault from err
+                else:
+                    changed = True
+                self._xml_rpc.channel.access.setOrgSharing(self._xml_rpc_key, channel_details['label'], 'public')
+
+            if changed:
+                LOG.info(
+                    '{stage_name}: Created non-existing software channel: {parent_channel_label}::{label}'.format(**channel_details),
+                    extra=log_structured_data)
+            else:
+                LOG.debug(
+                    '{stage_name}: No need to create already existing software channel: {parent_channel_label}::{label}'.format(**channel_details),
+                    extra=log_structured_data)
+
+            existing_labels.add(channel_details['label'])
+        elif not self._dry_run:
+            self._xml_rpc.channel.access.setOrgSharing(self._xml_rpc_key, channel_details['label'], 'public')
+            self._xml_rpc.channel.software.setDetails(
+                self._xml_rpc_key,
+                channel_details['label'],
+                {
+                    'gpg_key_url': channel_details.get('gpg_key_url', ''),
+                    'gpg_key_id': channel_details.get('gpg_key_id', ''),
+                    'gpg_key_fp': channel_details.get('gpg_key_fp', ''),
+                    'gpg_check': str(channel_details.get('gpg_check', True)),
+                },
+            )
+
+    def _ensure_channel_is_cloned(self, source_channel_label, channel_details, my_channel_labels):
+        if channel_details['label'] not in my_channel_labels:
+            log_structured_data = {'channel_'+k: v for k, v in channel_details.items()}
+            log_structured_data.update({
+                'stage_name': self._stage_name,
+                'source_channel_label': source_channel_label,
+                'event': {
+                    'dry_run': self._dry_run,
+                    'action': 'software_channel-clone',
+                },
+            })
+            LOG.info(
+                '{stage_name}: Clone software channel {source_channel_label} to {channel_parent_label}::{channel_label}'.format(**log_structured_data),
+                extra=log_structured_data,
+                #  stack_info=True
+            )
+            if not self._dry_run:
+                self._xml_rpc.channel.software.clone(
+                    self._xml_rpc_key,
+                    source_channel_label,
+                    # dict with label and name is required. parent_label is optional.
+                    channel_details,
+                    False)
+                self._xml_rpc.channel.access.setOrgSharing(self._xml_rpc_key, channel_details['label'], 'public')
+            my_channel_labels.add(channel_details['label'])
+        elif not self._dry_run:
+            self._xml_rpc.channel.access.setOrgSharing(self._xml_rpc_key, channel_details['label'], 'public')
+
+    def _ensure_channel_is_deleted(self, channel_label, my_channel_labels):
+        if channel_label in my_channel_labels:
+            log_structured_data = {
+                'stage_name': self._stage_name,
+                'channel_label': channel_label,
+                'event': {
+                    'dry_run': self._dry_run,
+                    'action': 'software_channel-delete',
+                },
+            }
+            LOG.info(
+                '{stage_name}: Delete software channel {channel_label}.'.format(**log_structured_data),
+                extra=log_structured_data)
+            if not self._dry_run:
+                self._xml_rpc.channel.software.delete(
+                    self._xml_rpc_key,
+                    channel_label)
+            my_channel_labels.discard(channel_label)
+
+    def _ensure_activation_key_is_present(self, activation_key_details, existing_activation_keys):
+        log_structured_data = activation_key_details
+        log_structured_data.update({
+            'stage_name': self._stage_name,
+        })
+        if activation_key_details['activation_key'] in existing_activation_keys:
+            current_child_channels = self._xml_rpc.activationkey.getDetails(
+                self._xml_rpc_key,
+                activation_key_details['activation_key'])
+            current_child_channel_labels = set(current_child_channels['child_channel_labels'])
+            desired_child_channel_labels = activation_key_details['child_channel_labels']
+            missing_child_channel_labels = desired_child_channel_labels.difference(current_child_channel_labels)
+            unwanted_child_channel_labels = current_child_channel_labels.difference(desired_child_channel_labels)
+
+            log_structured_data.update({
+                'missing_child_channel_labels': list(missing_child_channel_labels),
+                'unwanted_child_channel_labels': list(unwanted_child_channel_labels),
+                'event': {
+                    'dry_run': self._dry_run,
+                    'action': 'activation_key-update',
+                },
+            })
+
+            LOG.info(
+                '{stage_name}: Update child channels of {activation_key}.'
+                ' Add: {missing_child_channel_labels}.'
+                ' Delete: {unwanted_child_channel_labels}'.format(**log_structured_data),
+                extra=log_structured_data)
+
+            if not self._dry_run:
+                self._xml_rpc.activationkey.setDetails(
+                    self._xml_rpc_key,
+                    activation_key_details['activation_key'],
+                    {
+                        'description': activation_key_details['activation_key_wo_org'],
+                        'base_channel_label': activation_key_details['parent_label'],
+                    },
+                )
+                if len(missing_child_channel_labels) > 0:
+                    self._xml_rpc.activationkey.addChildChannels(
+                        self._xml_rpc_key,
+                        activation_key_details['activation_key'],
+                        list(missing_child_channel_labels))
+                if len(unwanted_child_channel_labels) > 0:
+                    self._xml_rpc.activationkey.removeChildChannels(
+                        self._xml_rpc_key,
+                        activation_key_details['activation_key'],
+                        list(unwanted_child_channel_labels))
+        else:
+            log_structured_data.update({
+                'event': {
+                    'dry_run': self._dry_run,
+                    'action': 'activation_key-create',
+                },
+            })
+            LOG.info(
+                '{stage_name}: Create activation key {activation_key} with child channels.'.format(**log_structured_data),
+                extra=log_structured_data)
+
+            if not self._dry_run:
+                self._xml_rpc.activationkey.create(
+                    self._xml_rpc_key,
+                    activation_key_details['activation_key_wo_org'],
+                    activation_key_details['activation_key_wo_org'],
+                    activation_key_details['parent_label'],
+                    [],
+                    False)
+                self._xml_rpc.activationkey.addChildChannels(
+                    self._xml_rpc_key,
+                    activation_key_details['activation_key'],
+                    list(activation_key_details['child_channel_labels']))
+
+    def _merge_source_into_target_channel(self, source_channel_label, target_channel_label):
+        log_structured_data = {
+            'stage_name': self._stage_name,
+            'source_channel_label': source_channel_label,
+            'target_channel_label': target_channel_label,
+            'event': {
+                'dry_run': self._dry_run,
+                'action': 'software_channel-merge',
+            },
+        }
+        LOG.info(
+            '{stage_name}: Merge {source_channel_label} into {target_channel_label}.'.format(**log_structured_data),
+            extra=log_structured_data)
+        if not self._dry_run:
+            self._xml_rpc.channel.software.mergePackages(self._xml_rpc_key, source_channel_label, target_channel_label)
+            self._xml_rpc.channel.software.mergeErrata(self._xml_rpc_key, source_channel_label, target_channel_label)
+
+    def _system_schedule_change_channels(
+        self,
+        system_id,
+        parent_channel_label,
+        desired_child_channel_labels,
+        current_child_channel_labels=None,
+        timestamp=None,
+        system_name=None
+    ):
+
+        if system_name is None:
+            system_name = self._get_system_name_for_id(system_id)
+
+        if timestamp is None:
+            timestamp = datetime.datetime.now()
+
+        log_structured_data = {
+            'stage_name': self._stage_name,
+            'system_id': system_id,
+            'system_name': system_name,
+            'parent_channel_label': parent_channel_label,
+            'desired_child_channel_labels': sorted(desired_child_channel_labels),
+            'event': {
+                'dry_run': self._dry_run,
+                'action': 'system-schedule_change_channels',
+            },
+        }
+        if current_child_channel_labels is not None:
+            log_structured_data.update({
+                'current_child_channel_labels': sorted(current_child_channel_labels),
+                'missing_child_channel_labels': sorted(desired_child_channel_labels.difference(current_child_channel_labels)),
+                'unwanted_child_channel_labels': sorted(current_child_channel_labels.difference(desired_child_channel_labels)),
+            })
+            LOG.info(
+                '{stage_name}: Schedule change channels for {system_name} with parent channel {parent_channel_label}.'
+                ' Add: {missing_child_channel_labels}.'
+                ' Delete: {unwanted_child_channel_labels}.'.format(**log_structured_data),
+                extra=log_structured_data)
+        else:
+            LOG.info(
+                '{stage_name}: Schedule change channels for {system_name} with parent channel {parent_channel_label}.'.format(**log_structured_data),
+                extra=log_structured_data)
+        if not self._dry_run:
+            self._xml_rpc.system.scheduleChangeChannels(
+                self._xml_rpc_key,
+                system_id,
+                parent_channel_label,
+                list(desired_child_channel_labels),
+                timestamp)
+
+    def _get_system_id_for_name(self, system_name):
+        try:
+            system_id = self._xml_rpc.system.getId(self._xml_rpc_key, system_name)[0]['id']
+        except (xmlrpclib.Fault, IndexError):
+            raise Exception("Could not get system id for system name: {}".format(system_name))
+
+        return system_id
+
+    def _get_system_name_for_id(self, system_id):
+        return self._xml_rpc.system.getId(self._xml_rpc_key, system_id)[0]['name']
+
+    def _get_system_ids_for_names(self, system_names, return_datatype=list):
+        system_ids = return_datatype()
+        for system_name in system_names:
+            log_structured_data = {
+                'system_name': system_name,
+                'org_id': self._get_current_org_id(),
+                'stage_name': self._stage_name,
+            }
+            try:
+                system_id = self._get_system_id_for_name(system_name)
+            except Exception as e:
+                LOG.warning(
+                    '{}: {}'.format(self._stage_name, e),
+                    extra=log_structured_data)
+                continue
+            getattr(system_ids, 'add', getattr(system_ids, 'append'))(system_id)
+
+        return system_ids
+
+    def _is_system_id_inactive(self, system_id):
+        if not self._inactive_systems:
+            self._inactive_systems = {v['id']: v for v in self._xml_rpc.system.listInactiveSystems(self._xml_rpc_key)}
+
+        return system_id in self._inactive_systems
+
+    def _ensure_system_group_is_present(self, system_group_details, existing_system_group_names):
+        log_structured_data = {'system_group_'+k: v for k, v in system_group_details.items()}
+        log_structured_data.update({
+            'stage_name': self._stage_name,
+            'org_id': self._get_current_org_id(),
+        })
+        desired_system_names_in_group = system_group_details['system_names']
+        if system_group_details['name'] not in existing_system_group_names:
+            if len(desired_system_names_in_group) > 0:
+                log_structured_data.update({
+                    'event': {
+                        'dry_run': self._dry_run,
+                        'action': 'system_group-create',
+                    },
+                })
+                LOG.info(
+                    '{stage_name}: Create system group {system_group_name}.'
+                    ' org_id: {org_id}.'.format(**log_structured_data),
+                    extra=log_structured_data)
+                if not self._dry_run:
+                    self._xml_rpc.systemgroup.create(
+                        self._xml_rpc_key,
+                        system_group_details['name'],
+                        system_group_details['description'])
+                existing_system_group_names.add(system_group_details['name'])
+        else:
+            current_system_group_description = self._xml_rpc.systemgroup.getDetails(
+                self._xml_rpc_key,
+                system_group_details['name'])['description']
+            if system_group_details['description'] != current_system_group_description:
+                log_structured_data.update({
+                    'event': {
+                        'dry_run': self._dry_run,
+                        'action': 'system_group-update',
+                    },
+                })
+                LOG.info(
+                    '{stage_name}: Set description of system group {system_group_name}'
+                    ' in org_id {org_id} to: {system_group_description}'.format(**log_structured_data),
+                    extra=log_structured_data)
+                if not self._dry_run:
+                    self._xml_rpc.systemgroup.update(
+                        self._xml_rpc_key,
+                        system_group_details['name'],
+                        system_group_details['description'])
+
+        current_systems_in_group = []
+        try:
+            current_systems_in_group = self._xml_rpc.systemgroup.listSystemsMinimal(
+                self._xml_rpc_key,
+                system_group_details['name'])
+        except xmlrpclib.Fault:
+            if len(desired_system_names_in_group) == 0:
+                return
+            elif not self._dry_run:
+                raise
+
+        current_system_names_in_group = set([s['name'] for s in current_systems_in_group])
+        missing_system_names_in_group = desired_system_names_in_group.difference(current_system_names_in_group)
+        unwanted_system_names_in_group = current_system_names_in_group.difference(desired_system_names_in_group)
+
+        log_structured_data.update({
+            'missing_system_names_in_group': list(missing_system_names_in_group),
+            'unwanted_system_names_in_group': list(unwanted_system_names_in_group),
+            'event': {
+                'dry_run': self._dry_run,
+                'action': 'system_group-update',
+            },
+        })
+
+        LOG.info(
+            '{stage_name}: Update system membership of system group {system_group_name}.'
+            ' Add: {missing_system_names_in_group}.'
+            ' Delete: {unwanted_system_names_in_group}.'
+            ' org_id: {org_id}.'.format(**log_structured_data),
+            extra=log_structured_data)
+
+        if not self._dry_run:
+            if len(missing_system_names_in_group) > 0:
+                self._xml_rpc.systemgroup.addOrRemoveSystems(
+                    self._xml_rpc_key,
+                    system_group_details['name'],
+                    self._get_system_ids_for_names(missing_system_names_in_group),
+                    True)
+            if len(unwanted_system_names_in_group) > 0:
+                self._xml_rpc.systemgroup.addOrRemoveSystems(
+                    self._xml_rpc_key,
+                    system_group_details['name'],
+                    self._get_system_ids_for_names(unwanted_system_names_in_group),
+                    False)
+
+    def _ensure_system_custominfo_key_exists(self, key_details):
+        my_keys = self._xml_rpc.system.custominfo.listAllKeys(self._xml_rpc_key)
+        my_key_by_labels = {k['label']: k for k in my_keys}
+
+        log_structured_data = {'key_'+k: v for k, v in key_details.items()}
+        log_structured_data.update({
+            'org_id': self._get_current_org_id(),
+            'stage_name': self._stage_name,
+        })
+
+        if key_details['label'] not in my_key_by_labels:
+            log_structured_data.update({
+                'event': {
+                    'dry_run': self._dry_run,
+                    'action': 'system_custominfo_key-create',
+                },
+            })
+            LOG.info(
+                '{stage_name}: Create non-existing system custominfo key: {key_label}'.format(**log_structured_data),
+                extra=log_structured_data)
+            if not self._dry_run:
+                self._xml_rpc.system.custominfo.createKey(
+                    self._xml_rpc_key,
+                    key_details['label'],
+                    key_details['description'])
+        elif my_key_by_labels[key_details['label']]['description'] != key_details['description']:
+            log_structured_data.update({
+                'event': {
+                    'dry_run': self._dry_run,
+                    'action': 'system_custominfo_key-update',
+                },
+            })
+            LOG.info(
+                '{stage_name}: Update system custominfo key description as "{key_description}" for key {key_label}.'.format(**log_structured_data),
+                extra=log_structured_data)
+            if not self._dry_run:
+                self._xml_rpc.system.custominfo.updateKey(
+                    self._xml_rpc_key,
+                    key_details['label'],
+                    key_details['description'])
+
+    def _ensure_custominfo_is_set_for_system(
+        self,
+        system_id,
+        key,
+        value,
+        system_name=None,
+    ):
+
+        if system_name is None:
+            system_name = self._get_system_name_for_id(system_id)
+
+        system_custom_info = self._xml_rpc.system.getCustomValues(
+            self._xml_rpc_key,
+            system_id)
+
+        if system_custom_info.get(key) != value:
+            log_structured_data = {
+                'org_id': self._get_current_org_id(),
+                'stage_name': self._stage_name,
+                'system_name': system_name,
+                'system_id': system_id,
+                'custominfo_key': key,
+                'custominfo_value': value,
+                'event': {
+                    'dry_run': self._dry_run,
+                    'action': 'system_custominfo-update',
+                },
+            }
+            LOG.info(
+                '{stage_name}: Set custom info {custominfo_key} of {system_name} to {custominfo_value}.'.format(**log_structured_data),
+                extra=log_structured_data)
+
+            if not self._dry_run:
+                self._xml_rpc.system.setCustomValues(
+                    self._xml_rpc_key,
+                    system_id,
+                    {key: value})
+
+    def _get_salt_local_cmd(self, tgt, fun, *args, **kwargs):
+        # Causes Unicode error on Pyhton3.
+        # Loading the module before logging is configured causes salt.log to mess heavily with the logging.
+        # https://github.com/saltstack/salt/issues/4994
+        from salt.client import LocalClient
+        local = LocalClient()
+
+        log_structured_data = {
+            'org_id': self._get_current_org_id(),
+            'stage_name': self._stage_name,
+            'salt_tgt': tgt,
+            'salt_fun': fun,
+        }
+
+        # Extracting that from the Python Salt module is too tricky I assume (argparser).
+        salt_tgt_type_to_cli_switch_mapping = {
+            'compound': '-C ',
+        }
+
+        log_structured_data_msg = copy.deepcopy(log_structured_data)
+        log_structured_data_msg.update({
+            'salt_args': ' '.join(args[0]) if len(args) else '',
+        })
+        if 'tgt_type' in kwargs:
+            log_structured_data_msg.update({
+                'salt_tgt_type': kwargs['tgt_type'],
+                'salt_tgt_cli_arg': salt_tgt_type_to_cli_switch_mapping.get(kwargs['tgt_type'], ''),
+            })
+        LOG.debug(
+            '{stage_name}: Run: salt -C \'{salt_tgt}\' {salt_fun} {salt_args}'.format(**log_structured_data_msg),
+            extra=log_structured_data)
+
+        salt_output = local.cmd(tgt, fun, *args, **kwargs)
+        log_structured_data.update({'salt_output': salt_output})
+
+        LOG.debug(
+            '{stage_name}: {salt_fun} returned: '.format(**log_structured_data),
+            extra=log_structured_data)
+
+        return salt_output
+
+    def _get_salt_run_output(self, fun, *args, **kwargs):
+        # For some reason this needs to be run two times.
+        # Maybe because pillars are updated before grains and we have one grain
+        # which is included as pillar.
+        if not self._fast:
+            for _ in range(2):
+                self._get_salt_local_cmd(
+                    # Targetting only a certain org_id here does not work
+                    # because the org_id might get updated as part of pillar
+                    # refresh :)
+                    #  'I@org_id:{}'.format(self._get_current_org_id()),
+                    '*',
+                    'saltutil.sync_all',
+                    tgt_type='compound',
+                    refresh=True)
+
+        salt_output = self._get_salt_local_cmd(
+            'I@org_id:{}'.format(self._get_current_org_id()),
+            fun,
+            *args,
+            tgt_type='compound',
+            **kwargs
+        )
+
+        return salt_output
+
+    def _get_fun_output_to_system_names_mapping(self, salt_run):
+        salt_minion_id_to_fun_output = self._get_salt_run_output(salt_run)
+
+        fun_output_to_system_names_mapping = {}
+        for minion_id, fun_output in salt_minion_id_to_fun_output.items():
+            fun_output_to_system_names_mapping.setdefault(fun_output, set())
+            fun_output_to_system_names_mapping[fun_output].add(minion_id)
+
+        return fun_output_to_system_names_mapping
+
+    def _guess_patch_phase_from_child_channel_labels(self, child_channel_labels):
+        guessed_patch_phaseironment = []
+        for patch_phase in self._config.patch_phases:
+            if any(True for c in child_channel_labels if c.endswith('-{}'.format(patch_phase))):
+                guessed_patch_phaseironment.append(patch_phase)
+
+        if len(guessed_patch_phaseironment) == 1:
+            return guessed_patch_phaseironment[0]
+
+        return "unknown"
+
+    def _get_patch_phase_to_system_names_mapping(self):
+        salt_minion_id_to_patch_phase = self._get_salt_run_output('pillar.get', [
+            self._config.pillar_of_minion_patch_phase])
+
+        patch_phase_to_system_names_mapping = {}
+        for minion_id, patch_phase in salt_minion_id_to_patch_phase.items():
+            if not patch_phase:
+                patch_phase = self._config.pillar_fallback_of_minion_patch_phase
+            patch_phase_to_system_names_mapping.setdefault(patch_phase, set())
+            patch_phase_to_system_names_mapping[patch_phase].add(minion_id)
+
+        return patch_phase_to_system_names_mapping
+
+    def _should_subscribe_to_child_channel(self, child_channel_label, patch_phase):
+        for other_patch_phase in self._config.patch_phases:
+            if other_patch_phase != patch_phase and child_channel_label.endswith('-{}'.format(other_patch_phase)):
+                return False
+
+        include_channel_re = re.search(
+            r'(?:patch_asap\b|\bsuse-packagehub\b|\bpool\b|\b{}$)'.format(patch_phase),
+            child_channel_label)
+        exclude_channel_re = re.search(
+            r'(?:patch_exceptions-)',
+            child_channel_label)
+
+        #  LOG.debug('{}: Channel {}: include: {}, exclude: {}'.format(
+        #      self._stage_name,
+        #      child_channel_label,
+        #      True if include_channel_re else False,
+        #      True if exclude_channel_re else False,
+        #  ))
+
+        return include_channel_re and not exclude_channel_re
+
+    def _get_current_updates_channel(self):
+        software_channels = []
+        # TODO: Performance: Check if listSoftwareChannels might be quicker
+        # instead of listMyChannels together with channel.software.getDetails.
+        for software_channel in self._xml_rpc.channel.listSoftwareChannels(self._xml_rpc_key):
+            if not software_channel['label'].startswith(self._config.current_updates_channel_label_prefix):
+                continue
+
+            if software_channel['parent_label'] == '':
+                continue
+
+            if self._should_skip_parent_channel(
+                software_channel['parent_label'],
+                software_channel['label']
+            ):
+                continue
+
+            if any([True for exclude_pattern in self._config.channel_label_exclude_patterns if exclude_pattern in software_channel['label']]):
+                continue
+
+            software_channels.append(software_channel)
+
+        return software_channels
+
+    def _get_patch_phase_for_channel(self, patch_phase):
+        return re.sub(r'-manuall?', '', patch_phase)
+
+    def _get_desired_child_channel_labels_for_system(self, parent_channel_label, patch_phase):
+        desired_child_channel_labels = set()
+        for software_channel in self._get_current_updates_channel():
+            if self._should_skip_parent_channel(
+                software_channel['parent_label'],
+                software_channel['label'],
+                parent_channel_filter=parent_channel_label,
+            ):
+                continue
+
+            if self._should_subscribe_to_child_channel(software_channel['label'], patch_phase):
+                desired_child_channel_labels.add(software_channel['label'])
+
+        return desired_child_channel_labels
+
+    def create_archive_channels(self):
+        self._log_method_start()
+
+        freeze_timestamp = datetime.date.today().isoformat()
+
+        my_channels = self._xml_rpc.channel.listMyChannels(self._xml_rpc_key)
+        # Used to implement idempotency.
+        my_channel_labels = set([c['label'] for c in my_channels])
+
+        vendor_channels = self._xml_rpc.channel.listVendorChannels(self._xml_rpc_key)
+
+        for source_channel in vendor_channels + my_channels:
+            if source_channel['label'].startswith(self._config.current_updates_channel_label_prefix):
+                continue
+            if source_channel['label'].startswith('archive-'):
+                continue
+
+            source_channel = self._xml_rpc.channel.software.getDetails(self._xml_rpc_key, source_channel['label'])
+
+            if self._should_skip_parent_channel(
+                source_channel['parent_channel_label'],
+                source_channel['label']
+            ):
+                continue
+
+            if source_channel['parent_channel_label'] == '':
+                vendor_parent_channel = source_channel
+                archive_parent_channel_label = 'archive-{}'.format(vendor_parent_channel['label'])
+
+                if any(True for label in my_channel_labels if label.startswith('third_party-regex_match-')):
+                    for third_party_channel in self._get_matching_third_party_channels(
+                        my_channels,
+                        vendor_parent_channel
+                    ):
+                        new_channel = {
+                            'label': archive_parent_channel_label,
+                            'name': 'Archive - {}'.format(vendor_parent_channel['name']),
+                            'summary': vendor_parent_channel['summary'],
+                            'arch_label': vendor_parent_channel['arch_label'],
+                            'parent_channel_label': '',
+                        }
+
+                        # Ensure parent channel exists. Needs to be done only.
+                        # As the function uses caching, it does not hurt to
+                        # call it more often. Cannot easily be moved outside of the loop.
+                        self._ensure_channel_is_created(new_channel, existing_labels=my_channel_labels)
+
+                        # Ensure clone of third party channel with freeze_timestamp exists.
+                        new_channel = {
+                            'label': 'archive-{}-{}-{}'.format(
+                                third_party_channel['label'],
+                                vendor_parent_channel['label'],
+                                freeze_timestamp,
+                            ),
+                            'name': 'archive - {} - {} - {}'.format(
+                                third_party_channel['name'],
+                                vendor_parent_channel['name'],
+                                freeze_timestamp,
+                            ),
+                            'parent_label': archive_parent_channel_label,
+                        }
+                        self._ensure_channel_is_cloned(
+                            third_party_channel['label'],
+                            new_channel,
+                            my_channel_labels)
+
+                continue
+
+            vendor_parent_channel = self._xml_rpc.channel.software.getDetails(self._xml_rpc_key, source_channel['parent_channel_label'])
+            archive_parent_channel_label = 'archive-{}'.format(vendor_parent_channel['label'])
+
+            if vendor_parent_channel['label'].startswith('third_party-regex_match-'):
+                continue
+
+            third_party = False
+            if source_channel['label'] in my_channel_labels:
+                if not source_channel['label'].startswith('third_party-'):
+                    continue
+                third_party = True
+            elif self._vendor_channel_is_immutable(source_channel['label']):
+                continue
+
+            if third_party:
+                archive_parent_channel_label = re.sub(r'third_party-', '', archive_parent_channel_label)
+
+            new_channel = {
+                'label': archive_parent_channel_label,
+                'name': 'Archive - {}'.format(vendor_parent_channel['name']),
+                'summary': vendor_parent_channel['summary'],
+                'arch_label': vendor_parent_channel['arch_label'],
+                'parent_channel_label': '',
+            }
+            self._ensure_channel_is_created(new_channel, existing_labels=my_channel_labels)
+
+            # Ensure clone of vendor channel with freeze_timestamp exists.
+            new_channel = {
+                'label': 'archive-{}-{}'.format(source_channel['label'], freeze_timestamp),
+                'name': 'archive - {} - {}'.format(source_channel['name'], freeze_timestamp),
+                'parent_label': archive_parent_channel_label,
+            }
+            self._ensure_channel_is_cloned(
+                source_channel['label'],
+                new_channel,
+                my_channel_labels)
+
+    def cleanup_archive_channels(self):
+        self._log_method_start()
+
+        now = datetime.datetime.now()
+
+        software_channels = self._xml_rpc.channel.listSoftwareChannels(self._xml_rpc_key)
+        software_channel_labels = set([c['label'] for c in software_channels])
+
+        for software_channel in software_channels:
+            if not software_channel['label'].startswith('archive-'):
+                continue
+            if software_channel['parent_label'] == '':
+                continue
+            if self._should_skip_parent_channel(
+                software_channel['parent_label'],
+                software_channel['label']
+            ):
+                continue
+
+            _re = re.search(r'^archive-.*(?P<date>\d{4}-\d{2}-\d{2})', software_channel['label'])
+            channel_date = datetime.datetime.strptime(_re.group('date'), "%Y-%m-%d")
+            channel_age = now - channel_date
+
+            if channel_age.days >= 16:
+                self._ensure_channel_is_deleted(software_channel['label'], software_channel_labels)
+
+    def _get_matching_third_party_channels(self, my_channels, software_channel):
+        """
+        Return list of third party channels that match the passed software_channel label.
+        Third party channels which have "third_party-regex_match" as their
+        parent channel can contain a regular expression pattern in their
+        channel summary. This pattern is tested against the software_channel
+        label. A match means that the third party channel applies to the
+        software_channel and should be included in it.
+
+        Channel name: Third party - Regex match based on channel summary
+        """
+        matching_third_party_channels = []
+
+        for third_party_channel in my_channels:
+            if not third_party_channel['label'].startswith('third_party-'):
+                continue
+
+            third_party_channel = self._xml_rpc.channel.software.getDetails(self._xml_rpc_key, third_party_channel['label'])
+            if not third_party_channel['parent_channel_label'].startswith('third_party-regex_match-'):
+                continue
+
+            re_pattern = third_party_channel['summary']
+            if not re.search(re_pattern, software_channel['label']):
+                continue
+
+            if self._should_skip_parent_channel(software_channel['label'], ''):
+                continue
+
+            matching_third_party_channels.append(third_party_channel)
+
+        return matching_third_party_channels
+
+    def setup(self):
+        self._log_method_start()
+
+        new_channel = {
+            'label': 'third_party-regex_match-{}'.format(self._config.architecture),
+            'name': 'Third party - Regex match based on channel summary - {}'.format(self._config.architecture),
+            'summary': textwrap.dedent("""
+                Parent channel that can hold third party child channels which
+                are automatically integrated into the patch management of other
+                (vendor) channels. The third party child channel is integrated
+                into channels when the regex specified in the child channel
+                summary matches the parent channel label.
+            """).replace('\n', ' '),
+            'arch_label': 'channel-{}'.format(self._config.architecture),
+            'parent_channel_label': '',
+        }
+        self._ensure_channel_is_created(new_channel)
+
+    def _delete_unknown_child_channels(self, created_channels_by_parent_label, my_channel_labels):
+
+        existing_channels_by_parent_label = {}
+        for software_channel in self._xml_rpc.channel.listSoftwareChannels(self._xml_rpc_key):
+            if software_channel['parent_label'] not in created_channels_by_parent_label:
+                continue
+
+            existing_channels_by_parent_label.setdefault(software_channel['parent_label'], set())
+            existing_channels_by_parent_label[software_channel['parent_label']].add(software_channel['label'])
+
+        log_structured_data = {
+            'org_id': self._get_current_org_id(),
+            'stage_name': self._stage_name,
+        }
+        LOG.debug(
+            '{stage_name}: Delete unknown child channels.'
+            ' org_id: {org_id}.'.format(**log_structured_data),
+            extra=log_structured_data)
+        for parent_channel_label, created_child_channel_labels in created_channels_by_parent_label.items():
+
+            existing_child_channel_labels = existing_channels_by_parent_label[parent_channel_label]
+
+            channel_labels_to_delete = existing_child_channel_labels.difference(created_child_channel_labels)
+
+            for channel_label_to_delete in channel_labels_to_delete:
+                self._ensure_channel_is_deleted(channel_label_to_delete, my_channel_labels)
+
+    def create_current_updates_channels(self):
+        # TODO: Merge with promote_channels so that when channel is first time created, we can merge it directly?
+        self._log_method_start()
+
+        my_channels = self._xml_rpc.channel.listMyChannels(self._xml_rpc_key)
+        # Used to implement idempotency.
+        my_channel_labels = set([c['label'] for c in my_channels])
+
+        vendor_channels = self._xml_rpc.channel.listVendorChannels(self._xml_rpc_key)
+
+        created_channels_by_parent_label = {}
+
+        # Iterate over vendor channels and third party channels.
+        # Everything else is filtered out early in the loop.
+        for source_channel in vendor_channels + my_channels:
+            # Filter out source channels we do not need to create current updates channels for. [[[
+            if source_channel['label'].startswith(self._config.current_updates_channel_label_prefix):
+                continue
+            if source_channel['label'].startswith('archive-'):
+                continue
+            if source_channel['label'].startswith('third_party-regex_match-'):
+                continue
+
+            third_party = False
+            if source_channel['label'] in my_channel_labels:
+                if not source_channel['label'].startswith('third_party-'):
+                    continue
+                third_party = True
+
+            if any(True for p in self._config.patch_phases if source_channel['label'].endswith('-{}'.format(p))):
+                continue
+
+            source_channel = self._xml_rpc.channel.software.getDetails(self._xml_rpc_key, source_channel['label'])
+            if self._should_skip_parent_channel(
+                source_channel['parent_channel_label'],
+                source_channel['label']
+            ):
+                continue
+            # ]]]
+
+            # Set attributes for to be created updates channel(s). [[[
+            current_updates_parent_channel_label = '{}{}'.format(
+                self._config.current_updates_channel_label_prefix,
+                source_channel['parent_channel_label'])
+            current_updates_channel_label = '{}{}'.format(
+                self._config.current_updates_channel_label_prefix,
+                source_channel['label'])
+            current_updates_channel_base_name = '{}{}'.format(
+                self._config.current_updates_channel_name_prefix,
+                source_channel['name'])
+            if third_party:
+                current_updates_parent_channel_label = re.sub(r'third_party-', '', current_updates_parent_channel_label)
+            # ]]]
+
+            if source_channel['parent_channel_label'] == '' and not third_party:
+
+                # Ensure parent current updates channel exists.
+                new_channel = {
+                    'label': current_updates_channel_label,
+                    'name': current_updates_channel_base_name,
+                    'summary': source_channel['summary'],
+                    'arch_label': source_channel['arch_label'],
+                    'parent_label': '',
+                }
+                self._ensure_channel_is_cloned(
+                    source_channel['label'],
+                    new_channel,
+                    my_channel_labels)
+
+                current_updates_parent_channel_label = '{}{}'.format(
+                    self._config.current_updates_channel_label_prefix,
+                    source_channel['label'])
+
+                # Check if third party channels want to be included into this current updates parent channel and create them in that case. [[[
+                for patch_phase in self._config.patch_phases:
+                    for third_party_channel in self._get_matching_third_party_channels(
+                        my_channels,
+                        source_channel,
+                    ):
+                        new_channel.update({
+                            'label': '{}{}-{}-{}'.format(
+                                self._config.current_updates_channel_label_prefix,
+                                third_party_channel['label'],
+                                source_channel['label'],
+                                patch_phase),
+                            'name': '{}{} - {} - {}'.format(
+                                self._config.current_updates_channel_name_prefix,
+                                third_party_channel['name'],
+                                source_channel['name'],
+                                patch_phase),
+                            'summary': 'See: {} ({}).'.format(
+                                third_party_channel['name'],
+                                third_party_channel['label']),
+                            'arch_label': source_channel['arch_label'],
+                            'parent_channel_label': current_updates_parent_channel_label,
+                            'gpg_key_url': third_party_channel['gpg_key_url'],
+                            'gpg_key_id': third_party_channel['gpg_key_id'],
+                            'gpg_key_fp': third_party_channel['gpg_key_fp'],
+                            'gpg_check': third_party_channel['gpg_check'],
+                        })
+                        self._ensure_channel_is_created(new_channel, existing_labels=my_channel_labels)
+                        created_channels_by_parent_label.setdefault(new_channel['parent_channel_label'], set())
+                        created_channels_by_parent_label[new_channel['parent_channel_label']].add(new_channel['label'])
+                # ]]]
+
+                # Create special channels for the parent channel. [[[
+                new_channel.update({
+                    'label': '{}patch_asap-{}'.format(
+                        self._config.current_updates_channel_label_prefix,
+                        source_channel['label']),
+                    'name': '{}Patch ASAP - {}'.format(
+                        self._config.current_updates_channel_name_prefix,
+                        source_channel['name']),
+                    'parent_channel_label': current_updates_parent_channel_label,
+                })
+                self._ensure_channel_is_created(new_channel, existing_labels=my_channel_labels)
+                created_channels_by_parent_label.setdefault(new_channel['parent_channel_label'], set())
+                created_channels_by_parent_label[new_channel['parent_channel_label']].add(new_channel['label'])
+
+                new_channel.update({
+                    'label': '{}patch_exceptions-{}'.format(
+                        self._config.current_updates_channel_label_prefix,
+                        source_channel['label']),
+                    'name': '{}Patch Exceptions - DO NOT SUBSCRIBE - {}'.format(
+                        self._config.current_updates_channel_name_prefix,
+                        source_channel['name']),
+                })
+                self._ensure_channel_is_created(new_channel, existing_labels=my_channel_labels)
+                created_channels_by_parent_label.setdefault(new_channel['parent_channel_label'], set())
+                created_channels_by_parent_label[new_channel['parent_channel_label']].add(new_channel['label'])
+                # ]]]
+
+                continue
+
+            if self._vendor_channel_is_immutable(source_channel['label']):
+                new_channel = {
+                    'label': current_updates_channel_label,
+                    'name': current_updates_channel_base_name,
+                    'parent_label': current_updates_parent_channel_label,
+                }
+                if source_channel['label'] in my_channel_labels:
+                    log_structured_data = {'channel_'+k: v for k, v in new_channel.items()}
+                    log_structured_data.update({
+                        'org_id': self._get_current_org_id(),
+                        'stage_name': self._stage_name,
+                    })
+                    LOG.warning(
+                        '{stage_name}: Immutable non-vendor channel is not supported: {channel_parent_label}::{channel_label}.'
+                        ' org_id: {org_id}.'.format(**log_structured_data),
+                        extra=log_structured_data)
+                    continue
+
+                self._ensure_channel_is_cloned(
+                    source_channel['label'],
+                    new_channel,
+                    my_channel_labels)
+                created_channels_by_parent_label.setdefault(new_channel['parent_label'], set())
+                created_channels_by_parent_label[new_channel['parent_label']].add(new_channel['label'])
+
+            elif source_channel['parent_channel_label'] not in [''] and '-regex_match-' not in source_channel['parent_channel_label']:
+                # For mutable channels, create all patch phase channels per source channel. [[[
+                for patch_phase in self._config.patch_phases:
+                    new_channel = {
+                        'label': '{}-{}'.format(current_updates_channel_label, patch_phase),
+                        'name': '{} - {}'.format(current_updates_channel_base_name, patch_phase),
+                        'summary': source_channel['summary'],
+                        'arch_label': source_channel['arch_label'],
+                        'parent_channel_label': current_updates_parent_channel_label,
+                    }
+                    self._ensure_channel_is_created(new_channel, existing_labels=my_channel_labels)
+                    created_channels_by_parent_label.setdefault(new_channel['parent_channel_label'], set())
+                    created_channels_by_parent_label[new_channel['parent_channel_label']].add(new_channel['label'])
+                # ]]]
+
+        self._delete_unknown_child_channels(created_channels_by_parent_label, my_channel_labels)
+
+    def create_activation_keys(self, only_patch_phase=None):
+        self._log_method_start()
+
+        existing_activation_keys_with_details = self._xml_rpc.activationkey.listActivationKeys(self._xml_rpc_key)
+        existing_activation_keys = set([k['key'] for k in existing_activation_keys_with_details])
+
+        activation_keys_to_patch_phase_map = {}
+
+        for software_channel in self._get_current_updates_channel():
+            activation_key_description = re.sub(
+                r'^{}'.format(self._config.current_updates_channel_label_prefix),
+                '',
+                software_channel['parent_label'])
+            activation_key_description = re.sub(r'pool-', '', activation_key_description)
+            activation_key_description = re.sub(r'sle-product-', '', activation_key_description)
+            activation_key_description = re.sub(r'sles', 'sle', activation_key_description)
+            activation_key_description = re.sub(r'sle_sap(\d+)-', r'sle\1-sap-', activation_key_description)
+
+            for patch_phase in self._config.patch_phases:
+                if only_patch_phase is not None and only_patch_phase != patch_phase:
+                    continue
+
+                activation_key_wo_org = '{}-{}'.format(
+                    activation_key_description,
+                    patch_phase,
+                )
+                activation_key = '{}-{}'.format(
+                    self._get_current_org_id(),
+                    activation_key_wo_org,
+                )
+                activation_keys_to_patch_phase_map.setdefault(activation_key, {})
+
+                activation_keys_to_patch_phase_map[activation_key]['patch_phase'] = patch_phase
+                activation_keys_to_patch_phase_map[activation_key]['activation_key'] = activation_key
+                activation_keys_to_patch_phase_map[activation_key]['activation_key_wo_org'] = activation_key_wo_org
+                activation_keys_to_patch_phase_map[activation_key]['parent_label'] = software_channel['parent_label']
+
+                activation_keys_to_patch_phase_map[activation_key].setdefault('child_channel_labels', set())
+
+                if self._should_subscribe_to_child_channel(software_channel['label'], patch_phase):
+                    activation_keys_to_patch_phase_map[activation_key]['child_channel_labels'].add(
+                        software_channel['label']
+                    )
+
+        # SuMa 3.2.6 has no activation key sorting and preserves the order the keys were added.
+        for activation_key in sorted(activation_keys_to_patch_phase_map.keys()):
+            details = activation_keys_to_patch_phase_map[activation_key]
+            self._ensure_activation_key_is_present(details, existing_activation_keys)
+
+    def _channel_matches_source_patch_phase(self, target_patch_phase, source_channel_label, today):
+        log_structured_data = {
+            'org_id': self._get_current_org_id(),
+            'stage_name': self._stage_name,
+        }
+        try:
+            source_patch_phase_index = self._config.patch_phases.index(target_patch_phase)
+        except ValueError as e:
+            LOG.warning(
+                '{}: {}'.format(self._stage_name, e),
+                extra=log_structured_data)
+            return False
+
+        if source_patch_phase_index == 0:
+            return re.search(
+                r'^archive-.*-{freeze_timestamp}$'.format(
+                    freeze_timestamp=today.isoformat(),
+                ),
+                source_channel_label)
+        else:
+            try:
+                source_patch_phase = self._config.patch_phases[source_patch_phase_index-1]
+            except ValueError as e:
+                LOG.warning(
+                    '{}: {}'.format(self._stage_name, e),
+                    extra=log_structured_data)
+                return False
+
+            return source_channel_label.endswith(source_patch_phase)
+
+    def promote_channels(self, target_patch_phase):
+        """
+        Promote/merge packages and packages from the previous patch phase into the target_patch_phase.
+        """
+
+        # Ensure that all current update channels we want to promote into
+        # actually exist.
+        self.create_current_updates_channels()
+
+        self._log_method_start()
+
+        today = datetime.date.today()
+
+        # Iterate over source channels from where packages and patches should
+        # be pulled from and merged into the patch phase channel.
+        # Everything else is filtered out early in the loop.
+        for source_channel in self._xml_rpc.channel.listMyChannels(self._xml_rpc_key):
+
+            if not self._channel_matches_source_patch_phase(target_patch_phase, source_channel['label'], today):
+                continue
+
+            source_channel = self._xml_rpc.channel.software.getDetails(self._xml_rpc_key, source_channel['label'])
+            if self._should_skip_parent_channel(
+                source_channel['parent_channel_label'],
+                source_channel['label']
+            ):
+                continue
+
+            if self._config.patch_phases.index(target_patch_phase) == 0:
+                source_channel_label_mid_part = re.sub(
+                    r'^archive-(?P<mid_part>.*)-\d{4}-\d{2}-\d{2}$',
+                    r'\g<mid_part>',
+                    source_channel['label'])
+            else:
+                source_channel_label_mid_part = re.sub(
+                    r'^{}'.format(self._config.current_updates_channel_label_prefix),
+                    '',
+                    source_channel['label'])
+                # The loop could be optimized away.
+                for env in self._config.patch_phases:
+                    source_channel_label_mid_part = re.sub(r'-{}$'.format(env), '', source_channel_label_mid_part)
+
+            current_updates_channel_label = '{}{}-{}'.format(
+                self._config.current_updates_channel_label_prefix,
+                source_channel_label_mid_part,
+                target_patch_phase)
+
+            self._merge_source_into_target_channel(source_channel['label'], current_updates_channel_label)
+
+    def delete_channels(self):
+        """
+        Similar to `spacecmd softwarechannel_delete` except that
+        delete_channels supports deleting the whole parent channel with all
+        it’s child channels.
+        """
+        self._log_method_start()
+
+        my_channels = self._xml_rpc.channel.listMyChannels(self._xml_rpc_key)
+        # Used to implement idempotency.
+        my_channel_labels = set([c['label'] for c in my_channels])
+
+        for software_channel in reversed(my_channels):
+            software_channel = self._xml_rpc.channel.software.getDetails(self._xml_rpc_key, software_channel['label'])
+            if self._should_skip_parent_channel(
+                software_channel['parent_channel_label'],
+                software_channel['label']
+            ):
+                continue
+
+            self._ensure_channel_is_deleted(software_channel['label'], my_channel_labels)
+
+    def update_system_channels(self):
+        self._log_method_start()
+
+        patch_phase_to_system_names_mapping = self._get_patch_phase_to_system_names_mapping()
+
+        for desired_patch_phase, system_names in patch_phase_to_system_names_mapping.items():
+            for system_name in system_names:
+                log_structured_data = {
+                    'system_name': system_name,
+                    'org_id': self._get_current_org_id(),
+                    'stage_name': self._stage_name,
+                }
+                try:
+                    system_id = self._get_system_id_for_name(system_name)
+                except Exception as e:
+                    LOG.warning(
+                        '{}: {}'.format(self._stage_name, e),
+                        extra=log_structured_data)
+                    continue
+
+                log_structured_data.update({
+                    'system_id': system_id,
+                })
+
+                current_child_channels = self._xml_rpc.system.listSubscribedChildChannels(
+                    self._xml_rpc_key,
+                    system_id)
+
+                if len(current_child_channels) == 0:
+                    LOG.warning(
+                        '{stage_name}: {system_name} is not subscribed to a parent channel.'
+                        ' Please fix this manually.'
+                        ' org_id: {org_id}.'.format(**log_structured_data),
+                        extra=log_structured_data)
+                    continue
+
+                current_child_channel_labels = set([c['label'] for c in current_child_channels])
+                current_channel_patch_phase = self._guess_patch_phase_from_child_channel_labels(current_child_channel_labels)
+                desired_channel_patch_phase = self._get_patch_phase_for_channel(desired_patch_phase)
+                log_structured_data.update({
+                    'current_channel_patch_phase': current_channel_patch_phase,
+                    'desired_channel_patch_phase': desired_channel_patch_phase,
+                    'desired_patch_phase': desired_patch_phase,
+                })
+
+                if current_channel_patch_phase != desired_channel_patch_phase:
+                    if self._is_system_id_inactive(system_id):
+                        LOG.info(
+                            '{stage_name}: Skipping software channel patch_phase mismatch for {system_name} because of system is inactive.'
+                            ' Current: {current_channel_patch_phase}.'
+                            ' Desired: {desired_channel_patch_phase}.'
+                            ' org_id: {org_id}.'.format(**log_structured_data),
+                            extra=log_structured_data)
+                        continue
+                    if desired_channel_patch_phase in self._config.patch_phases:
+                        LOG.info(
+                            '{stage_name}: Software channel patch_phase mismatch for {system_name}.'
+                            ' Current system patch_phase: {current_channel_patch_phase}.'
+                            ' Desired system patch_phase: {desired_channel_patch_phase} ({desired_patch_phase}).'
+                            ' org_id: {org_id}.'.format(**log_structured_data),
+                            extra=log_structured_data)
+                    else:
+                        LOG.warning(
+                            '{stage_name}: Skipping software channel patch_phase mismatch for {system_name} because of invalid desired patch_phase.'
+                            ' Current: {current_channel_patch_phase}.'
+                            ' Desired: {desired_channel_patch_phase}.'
+                            ' org_id: {org_id}.'.format(**log_structured_data),
+                            extra=log_structured_data)
+                        continue
+
+                parent_channel_label = current_child_channels[0]['parent_channel_label']
+
+                desired_child_channel_labels = self._get_desired_child_channel_labels_for_system(
+                    parent_channel_label,
+                    desired_channel_patch_phase,
+                )
+
+                if len(current_child_channel_labels.symmetric_difference(desired_child_channel_labels)) > 0:
+                    self._system_schedule_change_channels(
+                        system_id,
+                        parent_channel_label,
+                        desired_child_channel_labels,
+                        current_child_channel_labels=current_child_channel_labels,
+                        system_name=system_name)
+                else:
+                    LOG.debug(
+                        '{stage_name}: Software channels are already correctly assigned to {system_name}. No changes needed.'
+                        ' System patch_phase: {desired_channel_patch_phase} ({desired_patch_phase}).'
+                        ' org_id: {org_id}.'.format(**log_structured_data),
+                        extra=log_structured_data)
+
+    def update_system_groups(self):
+        self._log_method_start()
+
+        if len(self._config.system_groups) == 0:
+            return 0
+
+        existing_system_groups = self._xml_rpc.systemgroup.listAllGroups(self._xml_rpc_key)
+        existing_system_group_names = set([g['name'] for g in existing_system_groups])
+
+        # Similar to: https://docs.ansible.com/ansible/2.4/intro_configuration.html#ansible-managed
+        script_managed = 'This system group is maintained by the script {script_name}. All manual changes will be lost.'.format(
+            script_name=os.path.basename(__file__),
+        )
+
+        for group_config in self._config.system_groups:
+            fun_output_to_system_names_mapping = self._get_fun_output_to_system_names_mapping(
+                group_config.salt_run)
+
+            for fun_output_to_match, group_description in group_config.mapping.items():
+                system_group_name = group_config.pillar + '_' + fun_output_to_match
+                system_group_details = {
+                    'name': system_group_name,
+                    'description': group_description.format(script_managed=script_managed),
+                    'system_names': fun_output_to_system_names_mapping.get(fun_output_to_match, set()),
+                }
+                self._ensure_system_group_is_present(system_group_details, existing_system_group_names)
+
+    def update_system_custominfo(self):
+        self._log_method_start()
+
+        # Similar to: https://docs.ansible.com/ansible/2.4/intro_configuration.html#ansible-managed
+        script_managed = 'This custom system info is maintained by the script {script_name}. All manual changes will be lost.'.format(
+            script_name=os.path.basename(__file__),
+        )
+
+        for custominfo_config in self._config.system_custominfo:
+            custominfo_config['description'] = custominfo_config.description.format(
+                script_managed=script_managed)
+            self._ensure_system_custominfo_key_exists(custominfo_config)
+
+            salt_run_output = self._get_salt_run_output(custominfo_config.salt_run)
+            for system_name, fun_output in salt_run_output.items():
+                log_structured_data = {
+                    'system_name': system_name,
+                    'org_id': self._get_current_org_id(),
+                    'stage_name': self._stage_name,
+                }
+                if not fun_output:
+                    # Workaround for unknown issue in Salt 2019.2.0.
+                    # Some minions return False as grain value. When those minions are
+                    # queried for grains individually, then they give a more
+                    # reasonable answer.
+                    fun_output = self._get_salt_local_cmd(system_name, custominfo_config.salt_run).get(system_name)
+
+                    if not fun_output:
+                        log_structured_data_msg = copy.deepcopy(log_structured_data)
+                        # Convert to string to avoid type conflicts because the
+                        # value might also be False.
+                        log_structured_data_msg.update({
+                            'label': custominfo_config['label'],
+                            'value': str(fun_output),
+                        })
+                        if self._is_system_id_inactive(system_name):
+                            LOG.info(
+                                '{stage_name}: Skip setting of custom info {label} of {system_name} because system is inactive.'
+                                ' org_id: {org_id}.'.format(**log_structured_data_msg),
+                                extra=log_structured_data)
+                        else:
+                            LOG.warning(
+                                '{stage_name}: Skip setting of custom info {label} of {system_name} because of value: {value}.'
+                                ' Please fix this manually.'
+                                ' org_id: {org_id}.'.format(**log_structured_data_msg),
+                                extra=log_structured_data)
+                        continue
+
+                try:
+                    system_id = self._get_system_id_for_name(system_name)
+                except Exception as e:
+                    LOG.warning(
+                        '{}: {}'.format(self._stage_name, e),
+                        extra=log_structured_data)
+                    continue
+
+                self._ensure_custominfo_is_set_for_system(
+                    system_id,
+                    custominfo_config.label,
+                    fun_output,
+                    system_name=system_name)
+
+
+def main():
+    config = confuse.Configuration('suma_automater')
+    config.set_file('/etc/suma_automater/config.yaml')
+    config = config.get(CONFIG_TEMPLATE)
+
+    # CLI argument parsing [[[
+    args_parser = MyCLIParser(module_metadata=globals())
+    args_parser.add_argument(
+        '-P', '--patch-phase',
+        help="Which patch phase should patches be promotion to, sourced from the patch phase below.",
+        choices=config.patch_phases,
+    )
+    cli_args = args_parser.parse_args()
+    if cli_args.stage == 'promote' and not cli_args.environment:
+        args_parser.error("--stage=promote requires --environment.")
+    # ]]]
+
+    # Setup logging [[[
+    _LOG.setLevel(logging.DEBUG)
+    _LOG.addHandler(ypid.helpers.get_stderr_logging_handler(cli_args.loglevel))
+
+    if cli_args.journald:
+        from systemd.journal import JournalHandler
+
+        log_journal_handler = JournalHandler(SYSLOG_IDENTIFIER='suma_automater')
+        log_journal_handler.setLevel(logging.INFO)
+        _LOG.addHandler(log_journal_handler)
+    # ]]]
+
+    # Pass arguments to SuMaAutomater object for processing. [[[
+    try:
+
+        # Prevent readline from outputting escape sequences to non-terminals.
+        # We do not use readline in this script. Setting TERM messes with journald
+        # causing duplicate log entries.
+        #  if not sys.stdout.isatty():
+        #      logging.debug('Stdout is not a TTY, setting TERM=dumb')
+        #      os.environ['TERM'] = 'dumb'
+
+        suma_automater = SuMaAutomater(
+            dry_run=cli_args.dry_run,
+            fast=cli_args.fast,
+            parent_channel_filter=cli_args.parent_channel_filter,
+            config=config,
+        )
+        suma_automater.login(cli_args.spacecmd_conf_file)
+
+        if cli_args.stage == 'promote_channels':
+            suma_automater.promote_channels(cli_args.patch_phase)
+        elif cli_args.stage == 'create_activation_keys':
+            suma_automater.create_activation_keys(only_patch_phase=cli_args.patch_phase)
+        elif getattr(suma_automater, cli_args.stage, False):
+            getattr(suma_automater, cli_args.stage)()
+        else:
+            raise NotImplementedError("The stage {} is not implemented.".format(cli_args.stage))
+
+        suma_automater.logout()
+
+    except Exception as e:
+        LOG.exception("Uncaught exception: {0}".format(str(e)))
+    # ]]]
+
+
+if __name__ == '__main__':
+    main()

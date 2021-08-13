@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2021 Robin Schneider <robin.schneider@geberit.com>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+[Unit]
+Description=Trigger to daily patching and other daily tasks.
+
+[Timer]
+OnCalendar=04:55:00
+Persistent=true
+
+[Install]
+WantedBy=multi-user.target

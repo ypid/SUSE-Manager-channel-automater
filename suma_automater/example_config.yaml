@@ -1,0 +1,36 @@
+---
+
+# SPDX-FileCopyrightText: 2021 Robin Schneider <robin.schneider@geberit.com>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+patch_phases:
+  - 'phase-first'
+  - 'phase-last'
+
+# Architecture of the channels. Currently only has an effect in the setup stage
+# because everything else is derived.
+architectures:
+  - 'x86_64'
+
+pillar_of_minion_patch_phase: 'cmdb:patch_phase'
+pillar_fallback_of_minion_patch_phase: 'phase-last'
+
+channel_label_exclude_patterns:
+  - 'module-hpc'
+
+system_groups:
+  - salt_run:
+      - 'pillar.get'
+      - ['env', 'unknown']
+    mapping:
+      prod: 'Production environment. {script_managed}'
+      test: 'Test environment. {script_managed}'
+      unknown: 'Environment is unknown. {script_managed}'
+
+system_custominfo:
+  - salt_run:
+      - 'grains.get'
+      - ['system_id', 'unknown']
+    label: 'system_id'
+    description: 'Some custom ID. {script_managed}'
